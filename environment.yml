@@ -1,0 +1,10 @@
+name: ecobici
+channels:
+  - conda-forge
+dependencies:
+  - python=3.14
+  - pandas
+  - numpy
+  - matplotlib
+  - pip
+  - ipykernel
