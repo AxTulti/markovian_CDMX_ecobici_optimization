@@ -1,0 +1,7 @@
+step,removed,remaining,% of total
+records read,0,34698680,0.0
+unreadable date/time,0,34698680,0.0
+outside the period,0,34698680,0.0
+station not in GBFS (origin or destination),1633,34697047,0.005
+duration < 1 min or > 180 min,17383,34679664,0.05
+same origin and destination in < 3 min,67529,34612135,0.195

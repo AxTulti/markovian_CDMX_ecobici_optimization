@@ -226,3 +226,5 @@ __marimo__/
 *.zip
 cleaned.csv
 data/*
+# OSRM / OpenStreetMap extracts (too large for GitHub)
+*.osm.pbf
