@@ -45,6 +45,18 @@ _COLMAP = {
 }
 
 
+_DT_FORMATS = ["%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+               "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M", "%d/%m/%Y %I:%M:%S %p", "%Y-%m-%d %I:%M:%S %p",
+               "%d/%m/%y %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%d/%m/%Y %H:%M:%S.%f"]
+
+
+def _naive_ns(x: pd.Series) -> pd.Series:
+    """Drop any timezone (keeping the clock time as written) and use ns resolution."""
+    if getattr(x.dt, "tz", None) is not None:
+        x = x.dt.tz_localize(None)
+    return x.astype("datetime64[ns]")
+
+
 def _parse_dt(fecha: pd.Series, hora: pd.Series) -> pd.Series:
     """Fecha = 'YYYY-MM-DD', Hora = '1900-01-01 HH:MM:SS' (dummy date).
     Uses the date from Fecha and the clock time from Hora; returns naive datetime64[ns]."""
@@ -100,63 +112,34 @@ def load_trips(src, dayfirst: bool = True, max_hours: float = 6.0,
 # 1. Occupancy reconstruction
 # ----------------------------------------------------------------------------
 def truck_visit_times(win_start: pd.Series, win_end: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Assign a truck-visit time to each rebalancing move at one station.
+    """Assign a time to each rebalancing move at one station.
 
-    Definitions
-    -----------
-    Move i is the pair w_i = (s_i, e_i):
-        s_i = end of the bike's last trip (last time it was seen)
-        e_i = start of its next trip, from a different station
-    The truck moved the bike at some time in [s_i, e_i].
-
-    W = {w_1, ..., w_n} is the set of moves; win_start[i] = s_i, win_end[i] = e_i.
-
-    A visit is a subset V of W with a time tau_V lying in every window of V:
-        tau_V in [max_{h in V} s_h, min_{h in V} e_h]   (must be non-empty)
-
-    Goal: partition W into the fewest visits V_1, ..., V_m (m <= n).
-
-    Algorithm (greedy interval stabbing, optimal for this goal)
-    -----------------------------------------------------------
-    U <- W  (unassigned pairs)
-    while U is not empty:
-        e* <- min of e_h over U
-        V  <- {(s_h, e_h) in U : s_h <= e*}
-            Every pair in U has e_h >= e*, so e* lies in every window of V,
-            and the intersection [max_V s_h, e*] is non-empty.
-        tau_V <- (max_V s_h + e*) / 2      midpoint of the intersection
-        U <- U minus V
-
-    Each pair ends up in exactly one visit.
-
-    Invalid pairs (e_i < s_i, from overlapping trips in the data) are excluded
-    from U at the start: they get time NaT and group size 0.
-
-    Returns
-    -------
-    (tau, size): two Series aligned with the input index.
-        tau[i]  = time of the visit containing pair i
-        size[i] = number of pairs in that visit (0 if invalid)
-    """
+    Each move is only known to happen inside its window [s_i, e_i].  Assume the
+    fewest truck visits that explain all windows (greedy interval stabbing):
+    sort by e_i; the first unassigned window's end e opens a visit; every window
+    with s_i <= e joins it.  All members contain e, so their common intersection
+    [max s_i, e] is non-empty; the visit time is its midpoint.
+    Every valid window contains its own end, so each one either opens a visit or
+    joins exactly one.  Invalid windows (e_i < s_i, from overlapping trips in the
+    data) are left out: time NaT, group size 0 (build_stays then drops them).
+    Returns (time, group_size) aligned with the input index."""
     order = np.argsort(win_end.values, kind="stable")
     s, e = win_start.values[order], win_end.values[order]
-    tau = np.full(len(s), np.datetime64("NaT"), dtype="datetime64[ns]") # Contains times of alleged truck visit (interval / 2)
+    tau = np.full(len(s), np.datetime64("NaT"), dtype="datetime64[ns]")
     size = np.zeros(len(s), int)
-    unassigned = s <= e # only assing valid times (the start needs to happen before the end)
+    unassigned = s <= e   # invalid windows never join or open a visit
     for i in range(len(s)):
         if not unassigned[i]:
             continue
-        members = unassigned & (s <= e[i]) # Filter all elements belonging to the ith elem of e
+        members = unassigned & (s <= e[i])
         lo = s[members].max()
         tau[members] = lo + (e[i] - lo) / 2
         size[members] = members.sum()
         unassigned &= ~members
-        
-    # Repack into input order
     t_out = pd.Series(pd.NaT, index=win_start.index, dtype="datetime64[ns]")
     g_out = pd.Series(0, index=win_start.index)
-    t_out.iloc[order] = tau # time interval / 2 per travel (considerinf each s_i as a travel: some s_i may have same t/2 value)
-    g_out.iloc[order] = size # number of elements of the "membership window" to which each s_i belongs
+    t_out.iloc[order] = tau
+    g_out.iloc[order] = size
     return t_out, g_out
 
 
@@ -179,7 +162,7 @@ def build_stays(df: pd.DataFrame, station: str | None = None, rebal_cap_h: float
     d = df.sort_values(["bike", "t_out"]).reset_index(drop=True)
     t0, t1 = d["t_out"].min(), d["t_in"].max()
     g = d.groupby("bike", sort=False)
-    nxt_out = g["t_out"].shift(-1) # This is a 1 shifted list of the times of travel begginings
+    nxt_out = g["t_out"].shift(-1)
     nxt_from = g["from"].shift(-1)
     first = g.cumcount() == 0
     has_next = nxt_out.notna()
@@ -192,49 +175,31 @@ def build_stays(df: pd.DataFrame, station: str | None = None, rebal_cap_h: float
                       "start": d.t_in[consistent], "end": nxt_out[consistent], "kind": "observed"}),
     ]
     ws, we = d.t_in[rebal], nxt_out[rebal]
-    mid = ws + (we - ws) / 2 # Time at which we are going to consider the relocation to happen 
-                             # (Halfway trough last in and next out (s.t. id_in != id_out))
-                             
-    # Window [ws, we]: bike last seen at station A (ws), next seen at station B (we).
-    # Default guess: truck moved it at the midpoint.
-    # If half the window exceeds `cap`, count the bike at each station for only
-    # `cap` hours (long windows usually mean workshop, not docked).
-    end_A   = np.minimum(mid, ws + cap)   # bike counted at A during [ws, end_A)
-    start_B = np.maximum(mid, we - cap)   # bike counted at B during [start_B, we)
-                                         
+    mid = ws + (we - ws) / 2
+    end_A = np.minimum(mid, ws + cap)          # time bike leaves origin A
+    start_B = np.maximum(mid, we - cap)        # time bike appears at destination B
     if station is not None:
-        # Filter for relocations, cosider relocations at which the bikes were 
-        # I.  Relocated to station
-        # II. Relocated from station
-        for side, mask in (("Relocated from Station", d.to[rebal] == station), ("Relocated to Station", nxt_from[rebal] == station)):
+        for side, mask in (("A", d.to[rebal] == station), ("B", nxt_from[rebal] == station)):
             if mask.any():
                 tau, gsize = truck_visit_times(ws[mask], we[mask])
-                grouped = gsize > 1 # Masked of the truck travels that had more than one bicicle
+                grouped = gsize > 1
                 idx = tau.index[grouped]
-                if side == "Relocated from Station":
+                if side == "A":
                     end_A.loc[idx] = tau[grouped]
                 else:
                     start_B.loc[idx] = tau[grouped]
-                    
     parts.append(pd.DataFrame({"bike": d.bike[rebal], "station": d.to[rebal],
                                "start": ws, "end": end_A, "kind": "rebal_origin"}))
     parts.append(pd.DataFrame({"bike": d.bike[rebal], "station": nxt_from[rebal],
                                "start": start_B, "end": we, "kind": "rebal_dest"}))
     last = ~has_next
-    last_cap = pd.Timedelta(hours=rebal_cap_h)
-    
     parts.append(pd.DataFrame({"bike": d.bike[last], "station": d.to[last],
-                           "start": d.t_in[last],
-                           "end": (d.t_in[last] + last_cap).clip(upper=t1),
-                           "kind": "tail"}))
+                               "start": d.t_in[last], "end": t1, "kind": "tail"}))
     parts.append(pd.DataFrame({"bike": d.bike[first], "station": d["from"][first],
-                            "start": (d.t_out[first] - last_cap).clip(lower=t0),
-                            "end": d.t_out[first], "kind": "head"}))
-
+                               "start": t0, "end": d.t_out[first], "kind": "head"}))
     stays = pd.concat(parts, ignore_index=True)
 
     bad = stays["end"] < stays["start"]  # overlapping trips (data errors)
-    
     moves = pd.DataFrame({"bike": d.bike[rebal], "from_station": d.to[rebal],
                           "to_station": nxt_from[rebal], "window_start": d.t_in[rebal],
                           "window_end": nxt_out[rebal]})
@@ -603,16 +568,79 @@ def step_matrices(rates, daytype, C, lam_col="lam", mu_col="mu", substeps=1):
     return [expm(generator(l, m, C) * dt) for l, m in zip(lam, mu)]
 
 
-def transition_matrix(mats, b0, b1):
-    """Phi(b0 -> b1) = P_{b0} P_{b0+1} ... P_{b1-1}  (ordered: earliest first)."""
+def truck_matrix(C, sizes, probs, p_visit):
+    """Transition at a truck visit.
+    With prob 1 - p_visit nothing happens (identity); with prob p_visit the truck
+    drops k bikes, k = sizes[i] with prob probs[i], capped at C:
+        T = (1 - p_visit) I + p_visit * sum_k w_k S_k,   (S_k)[n, min(n+k, C)] = 1."""
+    T = (1 - p_visit) * np.eye(C + 1)
+    for k, w in zip(sizes, probs):
+        for n in range(C + 1):
+            T[n, min(n + int(k), C)] += p_visit * w
+    return T
+
+
+def estimate_truck_schedule(stays, station, C, days, bin_minutes, daytype="weekday",
+                            hours=(8, 11), min_size=5, holidays=None):
+    """Estimate one scheduled truck drop-off from the reconstructed stays.
+
+    A truck visit = several 'rebal_dest' stays at `station` starting at the same
+    instant (truck_visit_times gives all bikes of a visit the same time).
+    Keeps visits of >= min_size bikes, on `days` of `daytype`, inside `hours`.
+    Several visits in the same window on one day are added together.
+      p_visit = share of days of that type with a drop-off in the window
+      sizes/probs = distribution of the total bikes dropped per day (capped at C)
+      tau_h = median drop-off time (size-weighted mean per day); the truck is
+              applied at the bin edge closest to tau_h (`edge`, a bin index)."""
+    st = stays[(stays.station == station) & (stays.kind == "rebal_dest")]
+    g = st.groupby("start").size()
+    g = g[g >= min_size]
+    t = pd.Series(g.index)
+    keep = (t.dt.normalize().isin(pd.DatetimeIndex(days)).values
+            & (daytype_of(t.dt.normalize(), holidays) == daytype)
+            & (t.dt.hour >= hours[0]).values & (t.dt.hour < hours[1]).values)
+    g = g[keep]
+    if g.empty:
+        return None
+    df_ = pd.DataFrame({"date": g.index.normalize(), "size": g.values,
+                        "hour": g.index.hour + g.index.minute / 60 + g.index.second / 3600})
+    per_day = df_.groupby("date").apply(lambda x: pd.Series({
+        "size": x["size"].sum(), "hour": np.average(x.hour, weights=x["size"])}))
+    days = pd.DatetimeIndex(days)
+    n_days = int((daytype_of(days, holidays) == daytype).sum())
+    p_visit = len(per_day) / n_days
+    tau_h = float(per_day.hour.median())
+    sizes, counts = np.unique(np.minimum(per_day["size"].astype(int), C), return_counts=True)
+    probs = counts / counts.sum()
+    edge = int(round(tau_h * 60 / bin_minutes))
+    return {"daytype": daytype, "p_visit": p_visit, "tau_h": tau_h, "edge": edge,
+            "sizes": sizes, "probs": probs, "T": truck_matrix(C, sizes, probs, p_visit),
+            "per_day": per_day}
+
+
+def _truck_for(truck, daytype):
+    """(edge, T) if the truck applies on this day type, else (None, None)."""
+    if truck is None or truck["daytype"] != daytype:
+        return None, None
+    return truck["edge"], truck["T"]
+
+
+def transition_matrix(mats, b0, b1, edge=None, T=None):
+    """Phi(b0 -> b1) = P_{b0} P_{b0+1} ... P_{b1-1}  (ordered: earliest first).
+    If T is given, the truck jump T is applied at bin edge `edge` (between
+    P_{edge-1} and P_{edge}), when that edge lies in (b0, b1]."""
     Phi = np.eye(mats[0].shape[0])
     for b in range(b0, b1):
         Phi = Phi @ mats[b]
+        if T is not None and b + 1 == edge:
+            Phi = Phi @ T
     return Phi
 
 
-def day_profile(rates, daytype, C, p0, start_h=0.0, end_h=24.0, substeps=4, **cols):
-    """p(t) on a fine grid from start_h to end_h; p0 is an int (n0) or a vector."""
+def day_profile(rates, daytype, C, p0, start_h=0.0, end_h=24.0, substeps=4, truck=None, **cols):
+    """p(t) on a fine grid from start_h to end_h; p0 is an int (n0) or a vector.
+    truck: dict from estimate_truck_schedule (applied at its bin edge), or None."""
+    edge, T = _truck_for(truck, daytype)
     bm = rates.attrs["bin_minutes"]
     mats = step_matrices(rates, daytype, C, substeps=substeps, **cols)
     p = np.zeros(C + 1)
@@ -626,6 +654,10 @@ def day_profile(rates, daytype, C, p0, start_h=0.0, end_h=24.0, substeps=4, **co
         for s in range(substeps):
             p = p @ mats[b]
             ts.append((b + (s + 1) / substeps) * bm / 60)
+            ps.append(p.copy())
+        if T is not None and b + 1 == edge:      # truck jump: same time, new distribution
+            p = p @ T
+            ts.append((b + 1) * bm / 60)
             ps.append(p.copy())
     return np.array(ts), np.array(ps)
 
@@ -677,7 +709,7 @@ def hitting_time_linear(lam, mu, C, target=0):
     return out
 
 
-def losses_by_start_stock(rates, daytype, C, start_h=5.0, end_h=24.0, lam_col="lam", mu_col="mu"):
+def losses_by_start_stock(rates, daytype, C, start_h=5.0, end_h=24.0, lam_col="lam", mu_col="mu", truck=None):
     """For every starting stock n0 at start_h: expected lost pickups, lost returns,
     hours empty and hours full until end_h.  Exact integrals via Van Loan:
         expm([[Q, I], [0, 0]] * D) = [[e^{QD}, int_0^D e^{Qs} ds], [0, I]]."""
@@ -685,6 +717,7 @@ def losses_by_start_stock(rates, daytype, C, start_h=5.0, end_h=24.0, lam_col="l
     lam, mu = bin_rates(rates, daytype, lam_col, mu_col)
     K, D = C + 1, bm / 60
     Phi = np.eye(K)
+    edge, T = _truck_for(truck, daytype)
     acc = {k: np.zeros(K) for k in ("lost_pickups", "lost_returns", "hours_empty", "hours_full")}
     for b in range(int(start_h * 60 // bm), int(end_h * 60 // bm)):
         M = np.zeros((2 * K, 2 * K))
@@ -697,14 +730,18 @@ def losses_by_start_stock(rates, daytype, C, start_h=5.0, end_h=24.0, lam_col="l
         acc["hours_empty"] += PF[:, 0]
         acc["hours_full"] += PF[:, C]
         Phi = Phi @ E[:K, :K]
+        if T is not None and b + 1 == edge:
+            Phi = Phi @ T
     out = pd.DataFrame(acc)
     out.index.name = "n0"
     out["lost_total"] = out.lost_pickups + out.lost_returns
     return out
 
 
-def simulate_ctmc(rates, daytype, C, n0, start_h=0.0, end_h=24.0, rng=None):
-    """Gillespie simulation with piecewise-constant rates (for Monte Carlo checks)."""
+def simulate_ctmc(rates, daytype, C, n0, start_h=0.0, end_h=24.0, rng=None, truck=None):
+    """Gillespie simulation with piecewise-constant rates (for Monte Carlo checks).
+    With a truck: at its bin edge, with prob p_visit add one drawn size (capped at C)."""
+    edge, T = _truck_for(truck, daytype)
     rng = np.random.default_rng(rng)
     bm = rates.attrs["bin_minutes"]
     lam, mu = bin_rates(rates, daytype)
@@ -719,6 +756,10 @@ def simulate_ctmc(rates, daytype, C, n0, start_h=0.0, end_h=24.0, rng=None):
         dt = rng.exponential(1 / a) if a > 0 else np.inf
         if t + dt >= t_edge:  # memoryless: restart the clock at the bin edge
             t = t_edge
+            if T is not None and abs(t * 60 / bm - edge) < 1e-9 and rng.random() < truck["p_visit"]:
+                n = min(n + int(rng.choice(truck["sizes"], p=truck["probs"])), C)
+                ts.append(t)
+                ns.append(n)
             continue
         t += dt
         n += 1 if rng.random() < a_up / a else -1
@@ -750,11 +791,14 @@ def time_rescaling(seg, ev, rates, kind, C, days):
 
 
 def predictive_eval(occ, models: dict, C, train_days, test_days, holidays=None,
-                    origins=range(6, 22), horizons=(1, 2, 3), rng=0):
+                    origins=range(6, 22), horizons=(1, 2, 3), rng=0, trucks=None):
     """From the observed N(t0), predict N(t0 + H).  models: name -> rates table
     (uses columns lam/mu, or lam_naive/mu_naive if the name ends in 'naive').
     Adds a 'climatology' baseline: the empirical distribution of N at that clock
-    time on training days of the same type (ignores N(t0))."""
+    time on training days of the same type (ignores N(t0)).
+    trucks: optional dict model name -> truck schedule (estimate_truck_schedule);
+    models not listed get no truck."""
+    trucks = trucks or {}
     rng = np.random.default_rng(rng)
     any_rates = next(iter(models.values()))
     bm = any_rates.attrs["bin_minutes"]
@@ -784,7 +828,8 @@ def predictive_eval(occ, models: dict, C, train_days, test_days, holidays=None,
                 for name in models:
                     key = (name, dt, h0, H)
                     if key not in cache:
-                        cache[key] = transition_matrix(mats[name, dt], h0 * 60 // bm, (h0 + H) * 60 // bm)
+                        edge, T = _truck_for(trucks.get(name), dt)
+                        cache[key] = transition_matrix(mats[name, dt], h0 * 60 // bm, (h0 + H) * 60 // bm, edge, T)
                     preds[name] = cache[key][n0]
                 ck = ("climatology", dt, h0 + H)
                 if ck not in cache:
@@ -945,15 +990,17 @@ def simulate_trips(n_days=120, C=20, station="100", n_other=40, n_bikes_elsewher
     true_occ = pd.DataFrame(truth, columns=["t", "N"]).groupby("t", as_index=False).last()
     return out, true_occ
 
-def enforce_capacity(stays, station, arrival_times, C, removable=("rebal_origin", "tail")):
+
+def enforce_capacity(stays: pd.DataFrame, station: str, arrival_times, C: int,
+                     removable=("rebal_origin", "tail")):
     """Shorten truck-removal stays so that no arrival meets a full station.
 
     Two facts the data guarantees: N(t) <= C always, and an arrival at time t
-    proves N(t-) < C. Walk through time keeping the count; whenever either
+    proves N(t-) < C.  Walk through time keeping the count; whenever either
     fails, the truck must already have taken some bikes whose removal time we
-    only guessed. End the oldest such stays (kind in `removable`) at t until
-    the constraint holds. Stays seen directly in the trips ('observed') are
-    never shortened.
+    only guessed.  End the oldest such stays (kind in `removable`) at t until
+    the constraint holds.  Stays seen directly in the trips
+    ('observed') are never shortened.
     Returns (corrected stays, number of arrivals that still meet N >= C)."""
     import heapq
     st = stays[stays.station == station].copy()
