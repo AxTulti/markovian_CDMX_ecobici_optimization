@@ -356,9 +356,17 @@ def rate_lookup(rates, daytypes, minutes, col):
     return rates[col].reindex(idx).fillna(0.0).values
 
 
-def chronological_split(dates, test_frac=0.2):
-    days = np.array(sorted(pd.DatetimeIndex(pd.Series(dates).unique())))
+def chronological_split(dates, test_frac=0.2, use_only_weekdays=True):
+    # Get unique, sorted dates as a DatetimeIndex
+    days_idx = pd.DatetimeIndex(pd.Series(dates).unique()).sort_values()
+    
+    # Filter out weekends (Monday=0, Sunday=6)
+    if use_only_weekdays:
+        days_idx = days_idx[days_idx.dayofweek < 5]
+        
+    days = np.array(days_idx)
     k = int(round(len(days) * (1 - test_frac)))
+    
     return pd.DatetimeIndex(days[:k]), pd.DatetimeIndex(days[k:])
 
 
@@ -528,8 +536,13 @@ def poisson_loglik(seg, ev, rates, kind, C, days=None, floor=0.01):
     return float(np.log(r_ev).sum() - integral)
 
 
-def select_bin_width(seg, arr, dep, C, train_days, widths=(15, 30, 60, 120, 180), val_frac=0.25):
-    """Hold-out log-likelihood per event for several bin widths (higher is better)."""
+def select_bin_width(seg, arr, dep, C, train_days, widths=(15, 30, 60, 120, 180), val_frac=0.25,
+                     daytype="weekday", holidays=None):
+    """Hold-out log-likelihood per event for several bin widths (higher is better).
+    Only days of `daytype` are used for fitting and validation (None = all days)."""
+    train_days = pd.DatetimeIndex(train_days)
+    if daytype is not None:
+        train_days = train_days[daytype_of(train_days, holidays) == daytype]
     fit_d, val_d = chronological_split(train_days, val_frac)
     rows = []
     for w in widths:
