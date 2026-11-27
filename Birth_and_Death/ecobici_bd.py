@@ -581,42 +581,48 @@ def step_matrices(rates, daytype, C, lam_col="lam", mu_col="mu", substeps=1):
     return [expm(generator(l, m, C) * dt) for l, m in zip(lam, mu)]
 
 
-def truck_matrix(C, sizes, probs, p_visit):
-    """Transition at a truck visit.
-    With prob 1 - p_visit nothing happens (identity); with prob p_visit the truck
-    drops k bikes, k = sizes[i] with prob probs[i], capped at C:
-        T = (1 - p_visit) I + p_visit * sum_k w_k S_k,   (S_k)[n, min(n+k, C)] = 1."""
+def truck_matrix(C, sizes, probs, p_visit, direction=+1):
+    """T = (1 - p_visit) I + p_visit * sum_k w_k S_k.
+    direction=+1: drop-off, n -> min(n+k, C); direction=-1: removal, n -> max(n-k, 0)."""
     T = (1 - p_visit) * np.eye(C + 1)
     for k, w in zip(sizes, probs):
         for n in range(C + 1):
-            T[n, min(n + int(k), C)] += p_visit * w
+            m = min(n + int(k), C) if direction > 0 else max(n - int(k), 0)
+            T[n, m] += p_visit * w
     return T
 
 
-def estimate_truck_schedule(stays, station, C, days, bin_minutes, daytype="weekday",
-                            hours=(8, 11), min_size=5, holidays=None):
-    """Estimate one scheduled truck drop-off from the reconstructed stays.
+def estimate_truck_event(stays, station, C, days, bin_minutes, kind="drop",
+                         daytype="weekday", hours=(8, 11), min_size=5, holidays=None):
+    """One scheduled truck event (drop-off or removal) in a time window, from training days.
 
-    A truck visit = several 'rebal_dest' stays at `station` starting at the same
-    instant (truck_visit_times gives all bikes of a visit the same time).
-    Keeps visits of >= min_size bikes, on `days` of `daytype`, inside `hours`.
-    Several visits in the same window on one day are added together.
-      p_visit = share of days of that type with a drop-off in the window
-      sizes/probs = distribution of the total bikes dropped per day (capped at C)
-      tau_h = median drop-off time (size-weighted mean per day); the truck is
-              applied at the bin edge closest to tau_h (`edge`, a bin index)."""
-    st = stays[(stays.station == station) & (stays.kind == "rebal_dest")]
-    g = st.groupby("start").size()
+    kind='drop':  groups rebal_dest stays by start, keeps sizes >= min_size.
+    kind='remove': groups rebal_origin stays by end, keeps sizes >= min_size.
+    Several groups in the same window on one day are added together.
+      p_visit = share of days of that type with a truck event in the window
+      sizes/probs = distribution of the total bikes moved per day (capped at C)
+      tau_h = median event time (size-weighted mean per day); the truck is
+              applied at the bin edge closest to tau_h (`edge`, a bin index).
+      direction = +1 for drop-off, -1 for removal."""
+    if kind == "drop":
+        st = stays[(stays.station == station) & (stays.kind == "rebal_dest")]
+        g = st.groupby("start").size()
+    else:
+        st = stays[(stays.station == station) & (stays.kind == "rebal_origin")]
+        g = st.groupby("end").size()
     g = g[g >= min_size]
-    t = pd.Series(g.index)
-    keep = (t.dt.normalize().isin(pd.DatetimeIndex(days)).values
-            & (daytype_of(t.dt.normalize(), holidays) == daytype)
-            & (t.dt.hour >= hours[0]).values & (t.dt.hour < hours[1]).values)
-    g = g[keep]
     if g.empty:
         return None
-    df_ = pd.DataFrame({"date": g.index.normalize(), "size": g.values,
-                        "hour": g.index.hour + g.index.minute / 60 + g.index.second / 3600})
+    t = pd.Series(g.index)
+    d = t.dt.normalize()
+    hour = (t.dt.hour + t.dt.minute / 60 + t.dt.second / 3600).values
+    keep = (d.isin(pd.DatetimeIndex(days)).values
+            & (daytype_of(d, holidays) == daytype)
+            & (hour >= hours[0]) & (hour < hours[1]))
+    g, hour = g[keep], hour[keep]
+    if g.empty:
+        return None
+    df_ = pd.DataFrame({"date": g.index.normalize(), "size": g.values, "hour": hour})
     per_day = df_.groupby("date").apply(lambda x: pd.Series({
         "size": x["size"].sum(), "hour": np.average(x.hour, weights=x["size"])}))
     days = pd.DatetimeIndex(days)
@@ -625,37 +631,78 @@ def estimate_truck_schedule(stays, station, C, days, bin_minutes, daytype="weekd
     tau_h = float(per_day.hour.median())
     sizes, counts = np.unique(np.minimum(per_day["size"].astype(int), C), return_counts=True)
     probs = counts / counts.sum()
+    direction = +1 if kind == "drop" else -1
     edge = int(round(tau_h * 60 / bin_minutes))
-    return {"daytype": daytype, "p_visit": p_visit, "tau_h": tau_h, "edge": edge,
-            "sizes": sizes, "probs": probs, "T": truck_matrix(C, sizes, probs, p_visit),
+    return {"kind": kind, "daytype": daytype, "hours": hours, "p_visit": p_visit,
+            "tau_h": tau_h, "edge": edge, "sizes": sizes, "probs": probs,
+            "direction": direction,
+            "T": truck_matrix(C, sizes, probs, p_visit, direction),
             "per_day": per_day}
 
 
+# Keep old name as an alias for backward compatibility
+def estimate_truck_schedule(stays, station, C, days, bin_minutes, daytype="weekday",
+                            hours=(8, 11), min_size=5, holidays=None):
+    """Deprecated: use estimate_truck_event(kind='drop') instead."""
+    return estimate_truck_event(stays, station, C, days, bin_minutes, kind="drop",
+                                daytype=daytype, hours=hours, min_size=min_size,
+                                holidays=holidays)
+
+
 def _truck_for(truck, daytype):
-    """(edge, T) if the truck applies on this day type, else (None, None)."""
+    """(edge, T) if the truck applies on this day type, else (None, None).
+    Legacy helper kept for backward compatibility with single-truck callers."""
     if truck is None or truck["daytype"] != daytype:
         return None, None
     return truck["edge"], truck["T"]
 
 
-def transition_matrix(mats, b0, b1, edge=None, T=None):
+def trucks_at(trucks, daytype):
+    """{edge: [T, ...]} for the truck events of this day type, in time order."""
+    out = {}
+    for ev in sorted([e for e in (trucks or []) if e and e["daytype"] == daytype],
+                     key=lambda e: e.get("tau_h", e["edge"])):
+        out.setdefault(ev["edge"], []).append(ev["T"])
+    return out
+
+
+def transition_matrix(mats, b0, b1, jumps=None, T=None, edge=None):
     """Phi(b0 -> b1) = P_{b0} P_{b0+1} ... P_{b1-1}  (ordered: earliest first).
-    If T is given, the truck jump T is applied at bin edge `edge` (between
-    P_{edge-1} and P_{edge}), when that edge lies in (b0, b1]."""
+
+    Truck jumps are applied after P_b at bin edges in (b0, b1]:
+      - If `jumps` is given (dict {edge: [T, ...]}), all T matrices at each edge
+        are applied in list order.
+      - Also accepts legacy single-truck calls (edge, T) or (edge=..., T=...).
+    """
+    if jumps is not None and not isinstance(jumps, dict):
+        edge, jumps = jumps, None
     Phi = np.eye(mats[0].shape[0])
     for b in range(b0, b1):
         Phi = Phi @ mats[b]
-        if T is not None and b + 1 == edge:
+        if jumps is not None:
+            for Tj in jumps.get(b + 1, []):
+                Phi = Phi @ Tj
+        elif T is not None and b + 1 == edge:
             Phi = Phi @ T
     return Phi
 
 
-def day_profile(rates, daytype, C, p0, start_h=0.0, end_h=24.0, substeps=4, truck=None, **cols):
+def day_profile(rates, daytype, C, p0, start_h=0.0, end_h=24.0, substeps=4,
+                trucks=None, truck=None, **cols):
     """p(t) on a fine grid from start_h to end_h; p0 is an int (n0) or a vector.
-    truck: dict from estimate_truck_schedule (applied at its bin edge), or None."""
-    edge, T = _truck_for(truck, daytype)
+
+    trucks: list of event dicts from estimate_truck_event (drop-offs and removals).
+            After the substeps of bin b, every T in jumps.get(b+1) is applied.
+    truck:  legacy single-event dict (backward compatibility); ignored if trucks given."""
     bm = rates.attrs["bin_minutes"]
     mats = step_matrices(rates, daytype, C, substeps=substeps, **cols)
+    if trucks is not None:
+        jumps = trucks_at(trucks, daytype)
+    elif truck is not None:
+        edge, T = _truck_for(truck, daytype)
+        jumps = {edge: [T]} if T is not None else {}
+    else:
+        jumps = {}
     p = np.zeros(C + 1)
     if np.isscalar(p0):
         p[int(p0)] = 1.0
@@ -668,8 +715,8 @@ def day_profile(rates, daytype, C, p0, start_h=0.0, end_h=24.0, substeps=4, truc
             p = p @ mats[b]
             ts.append((b + (s + 1) / substeps) * bm / 60)
             ps.append(p.copy())
-        if T is not None and b + 1 == edge:      # truck jump: same time, new distribution
-            p = p @ T
+        for Tj in jumps.get(b + 1, []):       # truck jump(s): same time, new distribution
+            p = p @ Tj
             ts.append((b + 1) * bm / 60)
             ps.append(p.copy())
     return np.array(ts), np.array(ps)
@@ -722,15 +769,25 @@ def hitting_time_linear(lam, mu, C, target=0):
     return out
 
 
-def losses_by_start_stock(rates, daytype, C, start_h=5.0, end_h=24.0, lam_col="lam", mu_col="mu", truck=None):
+def losses_by_start_stock(rates, daytype, C, start_h=5.0, end_h=24.0,
+                          lam_col="lam", mu_col="mu", trucks=None, truck=None):
     """For every starting stock n0 at start_h: expected lost pickups, lost returns,
     hours empty and hours full until end_h.  Exact integrals via Van Loan:
-        expm([[Q, I], [0, 0]] * D) = [[e^{QD}, int_0^D e^{Qs} ds], [0, I]]."""
+        expm([[Q, I], [0, 0]] * D) = [[e^{QD}, int_0^D e^{Qs} ds], [0, I]].
+
+    trucks: list of event dicts (drop-offs and removals).
+    truck:  legacy single-event dict (backward compatibility); ignored if trucks given."""
     bm = rates.attrs["bin_minutes"]
     lam, mu = bin_rates(rates, daytype, lam_col, mu_col)
     K, D = C + 1, bm / 60
     Phi = np.eye(K)
-    edge, T = _truck_for(truck, daytype)
+    if trucks is not None:
+        jumps = trucks_at(trucks, daytype)
+    elif truck is not None:
+        edge, T = _truck_for(truck, daytype)
+        jumps = {edge: [T]} if T is not None else {}
+    else:
+        jumps = {}
     acc = {k: np.zeros(K) for k in ("lost_pickups", "lost_returns", "hours_empty", "hours_full")}
     for b in range(int(start_h * 60 // bm), int(end_h * 60 // bm)):
         M = np.zeros((2 * K, 2 * K))
@@ -743,21 +800,37 @@ def losses_by_start_stock(rates, daytype, C, start_h=5.0, end_h=24.0, lam_col="l
         acc["hours_empty"] += PF[:, 0]
         acc["hours_full"] += PF[:, C]
         Phi = Phi @ E[:K, :K]
-        if T is not None and b + 1 == edge:
-            Phi = Phi @ T
+        for Tj in jumps.get(b + 1, []):
+            Phi = Phi @ Tj
     out = pd.DataFrame(acc)
     out.index.name = "n0"
     out["lost_total"] = out.lost_pickups + out.lost_returns
     return out
 
 
-def simulate_ctmc(rates, daytype, C, n0, start_h=0.0, end_h=24.0, rng=None, truck=None):
+def simulate_ctmc(rates, daytype, C, n0, start_h=0.0, end_h=24.0, rng=None,
+                  trucks=None, truck=None):
     """Gillespie simulation with piecewise-constant rates (for Monte Carlo checks).
-    With a truck: at its bin edge, with prob p_visit add one drawn size (capped at C)."""
-    edge, T = _truck_for(truck, daytype)
+
+    trucks: list of event dicts; at each event's bin edge, with prob p_visit draw
+            one size from (sizes, probs) and set n = min(n+k, C) or max(n-k, 0).
+    truck:  legacy single-event dict (backward compatibility); ignored if trucks given."""
     rng = np.random.default_rng(rng)
     bm = rates.attrs["bin_minutes"]
     lam, mu = bin_rates(rates, daytype)
+    # Build a list of event dicts sorted by tau_h for this daytype
+    if trucks is not None:
+        events_list = sorted(
+            [e for e in trucks if e and e["daytype"] == daytype],
+            key=lambda e: e.get("tau_h", e["edge"]))
+    elif truck is not None and truck["daytype"] == daytype:
+        events_list = [truck]
+    else:
+        events_list = []
+    # Index events by edge for quick lookup
+    events_by_edge = {}
+    for ev in events_list:
+        events_by_edge.setdefault(ev["edge"], []).append(ev)
     t, n = start_h, n0
     ts, ns = [t], [n]
     while t < end_h:
@@ -769,10 +842,13 @@ def simulate_ctmc(rates, daytype, C, n0, start_h=0.0, end_h=24.0, rng=None, truc
         dt = rng.exponential(1 / a) if a > 0 else np.inf
         if t + dt >= t_edge:  # memoryless: restart the clock at the bin edge
             t = t_edge
-            if T is not None and abs(t * 60 / bm - edge) < 1e-9 and rng.random() < truck["p_visit"]:
-                n = min(n + int(rng.choice(truck["sizes"], p=truck["probs"])), C)
-                ts.append(t)
-                ns.append(n)
+            if abs(t * 60 / bm - (b + 1)) < 1e-9:
+                for ev in events_by_edge.get(b + 1, []):
+                    if rng.random() < ev["p_visit"]:
+                        k = int(rng.choice(ev["sizes"], p=ev["probs"]))
+                        n = min(n + k, C) if ev.get("direction", +1) > 0 else max(n - k, 0)
+                        ts.append(t)
+                        ns.append(n)
             continue
         t += dt
         n += 1 if rng.random() < a_up / a else -1
@@ -809,8 +885,8 @@ def predictive_eval(occ, models: dict, C, train_days, test_days, holidays=None,
     (uses columns lam/mu, or lam_naive/mu_naive if the name ends in 'naive').
     Adds a 'climatology' baseline: the empirical distribution of N at that clock
     time on training days of the same type (ignores N(t0)).
-    trucks: optional dict model name -> truck schedule (estimate_truck_schedule);
-    models not listed get no truck."""
+    trucks: optional dict model_name -> list of truck events (from estimate_truck_event).
+    Models not listed get no truck.  Also accepts legacy format model_name -> single event."""
     trucks = trucks or {}
     rng = np.random.default_rng(rng)
     any_rates = next(iter(models.values()))
@@ -841,8 +917,19 @@ def predictive_eval(occ, models: dict, C, train_days, test_days, holidays=None,
                 for name in models:
                     key = (name, dt, h0, H)
                     if key not in cache:
-                        edge, T = _truck_for(trucks.get(name), dt)
-                        cache[key] = transition_matrix(mats[name, dt], h0 * 60 // bm, (h0 + H) * 60 // bm, edge, T)
+                        # Build jumps for this model and daytype
+                        raw_trucks = trucks.get(name)
+                        if raw_trucks is not None:
+                            if isinstance(raw_trucks, dict):
+                                # Legacy: single event dict
+                                jumps = trucks_at([raw_trucks], dt)
+                            else:
+                                jumps = trucks_at(raw_trucks, dt)
+                        else:
+                            jumps = None
+                        cache[key] = transition_matrix(
+                            mats[name, dt], h0 * 60 // bm, (h0 + H) * 60 // bm,
+                            jumps=jumps)
                     preds[name] = cache[key][n0]
                 ck = ("climatology", dt, h0 + H)
                 if ck not in cache:
@@ -868,6 +955,55 @@ def calibration_table(pred, prob_col="p_empty", event="empty", C=None, bins=(0, 
     g = pd.cut(pred[prob_col], bins, right=False)
     return pd.DataFrame({"predicted": pred[prob_col], "observed": obs}).groupby(g, observed=True).agg(
         n=("observed", "size"), mean_predicted=("predicted", "mean"), observed_freq=("observed", "mean"))
+
+
+def historical_losses(seg, rates, C, dep=None, arr=None, days=None):
+    """Expected lost pickups/returns on the observed history, if rates were true demand.
+
+    For each segment of time where N is constant (dur_h hours, bin b, day type d):
+        lost pickups  = mu_hat_{d,b} * 1{N = 0} * dur_h
+        lost returns  = lam_hat_{d,b} * 1{N = C} * dur_h
+
+    Returns (per_day, summary, by_hour).
+      per_day: daily totals of lost_pickups, lost_returns, hours_empty, hours_full
+               (and departures, arrivals if dep/arr given).
+      summary: aggregate stats by daytype.
+      by_hour: average per day, by clock hour and daytype.
+
+    Use days=train (rates fitted on those days) or all days with rates refitted
+    on all days.  `arr` should be the filtered set (N_before < C); departures are
+    all departures."""
+    s = seg if days is None else seg[seg.date.isin(pd.DatetimeIndex(days))]
+    mu = rate_lookup(rates, s.daytype, s.minute, "mu")
+    lam = rate_lookup(rates, s.daytype, s.minute, "lam")
+    empty, full = (s.N <= 0).values, (s.N >= C).values
+    s = s.assign(lost_pickups=mu * empty * s.dur_h,
+                 lost_returns=lam * full * s.dur_h,
+                 hours_empty=empty * s.dur_h,
+                 hours_full=full * s.dur_h)
+    cols = ["lost_pickups", "lost_returns", "hours_empty", "hours_full"]
+    per_day = s.groupby(["date", "daytype"])[cols].sum()
+    if dep is not None:
+        per_day["departures"] = dep.groupby(["date", "daytype"]).size().reindex(
+            per_day.index).fillna(0)
+    if arr is not None:
+        per_day["arrivals"] = arr.groupby(["date", "daytype"]).size().reindex(
+            per_day.index).fillna(0)
+    summary = per_day.groupby(level="daytype").agg(["sum", "mean", "std"])
+    if dep is not None:
+        lp = per_day.groupby(level="daytype")[["lost_pickups", "departures"]].sum()
+        summary[("lost_share_pickups", "")] = lp.lost_pickups / (
+            lp.lost_pickups + lp.departures)
+    if arr is not None:
+        lr = per_day.groupby(level="daytype")[["lost_returns", "arrivals"]].sum()
+        summary[("lost_share_returns", "")] = lr.lost_returns / (
+            lr.lost_returns + lr.arrivals)
+    n_days = per_day.groupby(level="daytype").size()
+    by_hour = s.assign(hour=(s.minute // 60).astype(int)).groupby(
+        ["daytype", "hour"])[cols].sum()
+    days_per_row = n_days.reindex(by_hour.index.get_level_values("daytype")).values
+    by_hour = by_hour.div(days_per_row, axis=0)  # average per day, by clock hour
+    return per_day, summary, by_hour
 
 
 # ----------------------------------------------------------------------------
